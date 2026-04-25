@@ -1,0 +1,497 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { UploadCloud, Settings, FileAudio, Play, CheckCircle, AlertCircle, Copy, Download, Loader2, KeyRound, Clock, FileText } from 'lucide-react';
+
+// --- 工具函數：處理時間格式 ---
+const formatTime = (seconds) => {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+};
+
+const formatSRTTime = (seconds) => {
+  const date = new Date(0);
+  date.setUTCMilliseconds(seconds * 1000);
+  const hours = String(date.getUTCHours()).padStart(2, '0');
+  const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+  const secs = String(date.getUTCSeconds()).padStart(2, '0');
+  const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+  return `${hours}:${minutes}:${secs},${ms}`;
+};
+
+// --- 主元件 ---
+export default function App() {
+  const [apiKey, setApiKey] = useState('');
+  const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
+  const [file, setFile] = useState(null);
+  const [status, setStatus] = useState('idle');
+  const [progressMsg, setProgressMsg] = useState('');
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [segments, setSegments] = useState([]);
+  const [language, setLanguage] = useState('');
+  const [viewMode, setViewMode] = useState('text');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const savedKey = localStorage.getItem('openai_api_key');
+    if (savedKey) {
+      setApiKey(savedKey);
+    } else {
+      setIsKeyModalOpen(true);
+    }
+  }, []);
+
+  const saveApiKey = (key) => {
+    localStorage.setItem('openai_api_key', key);
+    setApiKey(key);
+    setIsKeyModalOpen(false);
+  };
+
+  const onFileChange = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      setFile(selectedFile);
+      setSegments([]);
+      setStatus('idle');
+      setErrorMessage('');
+    }
+  };
+
+  const handleDragOver = (e) => e.preventDefault();
+  const handleDrop = (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      setFile(e.dataTransfer.files[0]);
+      setSegments([]);
+      setStatus('idle');
+      setErrorMessage('');
+    }
+  };
+
+  // --- 核心轉錄邏輯 (整合最穩定版 FFmpeg.wasm v0.11 單執行緒) ---
+  const startTranscription = async () => {
+    if (!apiKey) {
+      setIsKeyModalOpen(true);
+      return;
+    }
+    if (!file) return;
+
+    setStatus('processing');
+    setSegments([]);
+    setErrorMessage('');
+    setProgressPercent(5);
+    setProgressMsg('正在準備處理...');
+
+    try {
+      const MAX_DIRECT_SIZE = 24 * 1024 * 1024; // 24MB
+
+      // 1. 小檔案直接上傳，最快！
+      if (file.size <= MAX_DIRECT_SIZE) {
+        setProgressPercent(30);
+        setProgressMsg('檔案小於 24MB，正在直接上傳至 OpenAI 處理...');
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('model', 'whisper-1');
+        formData.append('response_format', 'verbose_json');
+        if (language) formData.append('language', language);
+
+        const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error?.message || `API 錯誤: ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (data.segments && data.segments.length > 0) {
+            setSegments(data.segments);
+        } else if (data.text) {
+            setSegments([{ id: 0, start: 0, end: data.duration || 0, text: data.text }]);
+        }
+        
+        setProgressPercent(100);
+        setProgressMsg('轉錄完成！');
+        setStatus('done');
+        return;
+      }
+
+      // 2. 大檔案處理：載入並使用 FFmpeg WASM 引擎 v0.11.6
+      setProgressPercent(10);
+      setProgressMsg('檔案超過 24MB，正在載入進階影音處理引擎...');
+
+      // 動態載入 ffmpeg.wasm v0.11 腳本 (避免 v0.12 的 Web Worker 跨網域錯誤)
+      if (!window.FFmpeg) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('無法載入 FFmpeg 引擎，請檢查網路連線或關閉廣告阻擋器。'));
+          document.body.appendChild(script);
+        });
+      }
+
+      const { createFFmpeg, fetchFile } = window.FFmpeg;
+      
+      const ffmpeg = createFFmpeg({
+        corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js',
+        mainName: 'main', // 關鍵修復：指定單執行緒核心的主函數名為 main，徹底解決 proxy_main 崩潰問題
+        log: false,
+      });
+
+      setProgressMsg('正在初始化處理引擎...');
+      await ffmpeg.load();
+
+      setProgressMsg('正在將您的檔案載入安全記憶體空間...');
+      ffmpeg.FS('writeFile', 'input', await fetchFile(file));
+
+      setProgressPercent(15);
+      setProgressMsg('正在進行高精度切割與音訊最佳化 (自動轉為 16kHz 單聲道 WAV)...這可能需要一至兩分鐘。');
+      
+      // 執行 FFmpeg 切割指令
+      await ffmpeg.run(
+        '-i', 'input',
+        '-f', 'segment',
+        '-segment_time', '600',
+        '-c:a', 'pcm_s16le', // 轉換為 PCM 16-bit WAV
+        '-ar', '16000',      // 降取樣到 16kHz
+        '-ac', '1',          // 轉為單聲道
+        'out%03d.wav'
+      );
+
+      // 讀取切割出來的檔案
+      const files = ffmpeg.FS('readdir', '/');
+      const chunkFiles = files.filter(f => f.startsWith('out') && f.endsWith('.wav')).sort();
+
+      if (chunkFiles.length === 0) {
+        throw new Error("無法解析或切割此檔案。這可能是一個損壞的檔案，或者不包含音訊軌道。");
+      }
+
+      let allSegments = [];
+      const chunkDuration = 600;
+
+      // 依序上傳每一個音訊片段
+      for (let i = 0; i < chunkFiles.length; i++) {
+        const chunkName = chunkFiles[i];
+        setProgressMsg(`正在上傳並由 AI 轉錄第 ${i + 1} / ${chunkFiles.length} 段...`);
+        setProgressPercent(20 + Math.floor((i / chunkFiles.length) * 75));
+
+        const chunkData = ffmpeg.FS('readFile', chunkName);
+        // 使用 Uint8Array 建立 Blob，確保記憶體資料正確轉換
+        const chunkBlob = new Blob([chunkData], { type: 'audio/wav' });
+        const chunkFileObj = new File([chunkBlob], chunkName, { type: 'audio/wav' });
+
+        const formData = new FormData();
+        formData.append('file', chunkFileObj);
+        formData.append('model', 'whisper-1');
+        formData.append('response_format', 'verbose_json');
+        if (language) formData.append('language', language);
+
+        const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error?.message || `API 錯誤: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // 校正每個片段的時間軸偏移量
+        const timeOffset = i * chunkDuration;
+        
+        if (data.segments && data.segments.length > 0) {
+            const adjustedSegments = data.segments.map(seg => ({
+                ...seg,
+                start: seg.start + timeOffset,
+                end: seg.end + timeOffset,
+            }));
+            allSegments = [...allSegments, ...adjustedSegments];
+            setSegments(allSegments);
+        } else if (data.text) {
+            allSegments.push({
+                id: i,
+                start: timeOffset,
+                end: timeOffset + (data.duration || chunkDuration),
+                text: data.text
+            });
+            setSegments(allSegments);
+        }
+      }
+
+      setProgressPercent(100);
+      setProgressMsg('轉錄完成！');
+      setStatus('done');
+
+      // 清理記憶體，釋放資源
+      try {
+          ffmpeg.FS('unlink', 'input');
+          for (const f of chunkFiles) {
+              ffmpeg.FS('unlink', f);
+          }
+      } catch (e) {
+          console.warn("清理暫存檔時發生警告:", e);
+      }
+
+    } catch (err) {
+      console.error("Transcription Process Error:", err);
+      setStatus('error');
+      setErrorMessage(err.message || '處理音訊時發生未知的錯誤');
+    }
+  };
+
+  const generateText = () => segments.map(s => s.text.trim()).join(' ');
+
+  const generateSRT = () => segments.map((seg, index) => {
+    return `${index + 1}\n${formatSRTTime(seg.start)} --> ${formatSRTTime(seg.end)}\n${seg.text.trim()}\n`;
+  }).join('\n');
+
+  const handleCopy = () => {
+    const content = viewMode === 'text' ? generateText() : generateSRT();
+    
+    // 建立一個隱藏的 textarea 來突破 iFrame 的剪貼簿限制
+    const textArea = document.createElement("textarea");
+    textArea.value = content;
+    
+    // 避免畫面滾動，將其移出可視範圍
+    textArea.style.position = "fixed";
+    textArea.style.left = "-999999px";
+    textArea.style.top = "-999999px";
+    
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    try {
+      document.execCommand('copy');
+      alert('已複製到剪貼簿！');
+    } catch (err) {
+      console.error('複製失敗', err);
+      alert('複製失敗，請手動選取文字複製。');
+    }
+    
+    document.body.removeChild(textArea);
+  };
+
+  const handleDownload = () => {
+    const content = viewMode === 'text' ? generateText() : generateSRT();
+    const ext = 'txt';
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const originalName = file ? file.name.split('.')[0] : 'transcript';
+    a.download = `${originalName}_transcription.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
+      <nav className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
+        <div className="flex items-center space-x-2">
+          <div className="bg-indigo-600 p-2 rounded-lg">
+            <FileAudio className="w-6 h-6 text-white" />
+          </div>
+          <h1 className="text-xl font-bold text-gray-900 tracking-tight">ProTape <span className="text-sm font-normal text-gray-500 ml-1">AI 轉錄</span></h1>
+        </div>
+        <button 
+          onClick={() => setIsKeyModalOpen(true)}
+          className="flex items-center space-x-2 text-sm font-medium text-gray-600 hover:text-indigo-600 transition-colors px-3 py-2 rounded-md hover:bg-indigo-50"
+        >
+          <Settings className="w-4 h-4" />
+          <span>API 設定</span>
+        </button>
+      </nav>
+
+      <main className="max-w-4xl mx-auto p-6 mt-8">
+        {status === 'idle' && (
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden mb-8">
+            <div className="p-8">
+              <div 
+                className="border-2 border-dashed border-gray-300 rounded-xl p-12 flex flex-col items-center justify-center text-center hover:bg-gray-50 transition-colors cursor-pointer"
+                onDragOver={handleDragOver}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <input type="file" ref={fileInputRef} onChange={onFileChange} className="hidden" accept="audio/*,video/*" />
+                <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mb-4">
+                  <UploadCloud className="w-8 h-8 text-indigo-600" />
+                </div>
+                {file ? (
+                  <div>
+                    <p className="text-lg font-semibold text-gray-800">{file.name}</p>
+                    <p className="text-sm text-gray-500 mt-1">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-lg font-medium text-gray-700">點擊或拖曳音訊/影片檔案至此</p>
+                    <p className="text-sm text-gray-500 mt-2">支援 MP3, MP4, WAV, M4A, MOV 等常見格式<br/>(內建 FFmpeg 引擎，支援超大檔案自動完美切片)</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-6 flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="w-full sm:w-auto flex items-center space-x-3">
+                  <label className="text-sm font-medium text-gray-700">音檔語言:</label>
+                  <select 
+                    value={language} 
+                    onChange={(e) => setLanguage(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="">自動偵測</option>
+                    <option value="zh">繁體中文</option>
+                    <option value="en">英文</option>
+                    <option value="ja">日文</option>
+                    <option value="ko">韓文</option>
+                  </select>
+                </div>
+                
+                <button
+                  onClick={startTranscription}
+                  disabled={!file}
+                  className={`w-full sm:w-auto flex items-center justify-center space-x-2 px-6 py-3 rounded-xl font-semibold text-white transition-all ${
+                    file ? 'bg-indigo-600 hover:bg-indigo-700 shadow-md hover:shadow-lg transform hover:-translate-y-0.5' : 'bg-gray-300 cursor-not-allowed'
+                  }`}
+                >
+                  <Play className="w-5 h-5 fill-current" />
+                  <span>開始轉錄</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {status === 'processing' && (
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-12 flex flex-col items-center justify-center text-center">
+            <Loader2 className="w-12 h-12 text-indigo-600 animate-spin mb-6" />
+            <h3 className="text-xl font-semibold text-gray-800 mb-2">正在處理您的檔案</h3>
+            <p className="text-gray-500 mb-8 max-w-md">{progressMsg}</p>
+            
+            <div className="w-full max-w-md bg-gray-200 rounded-full h-3 mb-2 overflow-hidden">
+              <div className="bg-indigo-600 h-3 rounded-full transition-all duration-300 ease-out" style={{ width: `${progressPercent}%` }}></div>
+            </div>
+            <p className="text-sm font-medium text-indigo-600">{progressPercent}%</p>
+          </div>
+        )}
+
+        {status === 'error' && (
+          <div className="bg-red-50 rounded-2xl border border-red-200 p-8 flex flex-col items-center text-center">
+            <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
+            <h3 className="text-lg font-bold text-red-800 mb-2">處理失敗</h3>
+            <p className="text-red-600 mb-6 max-w-2xl whitespace-pre-line text-left bg-white p-4 rounded-lg border border-red-100 shadow-sm">{errorMessage}</p>
+            <button onClick={() => setStatus('idle')} className="px-6 py-2 bg-white text-red-600 border border-red-200 rounded-lg font-medium hover:bg-red-50 transition-colors">
+              返回重試
+            </button>
+          </div>
+        )}
+
+        {(status === 'done' || (status === 'processing' && segments.length > 0)) && (
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden flex flex-col h-[700px]">
+            <div className="border-b border-gray-200 p-4 bg-gray-50 flex flex-col sm:flex-row justify-between items-center gap-4">
+              <div className="flex bg-gray-200 p-1 rounded-lg">
+                <button onClick={() => setViewMode('text')} className={`flex items-center space-x-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${viewMode === 'text' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}>
+                  <FileText className="w-4 h-4" />
+                  <span>純文字</span>
+                </button>
+                <button onClick={() => setViewMode('srt')} className={`flex items-center space-x-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${viewMode === 'srt' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}>
+                  <Clock className="w-4 h-4" />
+                  <span>時間軸 (SRT)</span>
+                </button>
+              </div>
+
+              <div className="flex space-x-2">
+                <button onClick={handleCopy} className="flex items-center space-x-2 px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
+                  <Copy className="w-4 h-4" />
+                  <span className="hidden sm:inline">複製</span>
+                </button>
+                <button onClick={handleDownload} className="flex items-center space-x-2 px-3 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors shadow-sm">
+                  <Download className="w-4 h-4" />
+                  <span>匯出</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 p-6 overflow-y-auto bg-white">
+              {viewMode === 'text' ? (
+                <div className="prose prose-indigo max-w-none">
+                  <p className="text-gray-800 leading-relaxed text-lg whitespace-pre-wrap">{generateText()}</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {segments.map((seg, idx) => (
+                    <div key={idx} className="flex flex-col sm:flex-row sm:space-x-4 p-3 rounded-lg hover:bg-gray-50 transition-colors group">
+                      <div className="text-xs font-mono text-indigo-500 bg-indigo-50 px-2 py-1 rounded w-fit sm:w-40 flex-shrink-0 self-start mt-1">
+                        {formatTime(seg.start)} - {formatTime(seg.end)}
+                      </div>
+                      <div className="mt-2 sm:mt-0 text-gray-800 leading-relaxed">{seg.text}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {status === 'processing' && (
+                <div className="mt-6 flex items-center justify-center space-x-2 text-indigo-500 py-4 border-t border-dashed border-gray-200">
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <span className="text-sm font-medium">持續轉錄中...</span>
+                </div>
+              )}
+            </div>
+            
+            {status === 'done' && (
+               <div className="border-t border-gray-200 p-4 bg-gray-50 flex justify-between items-center">
+                 <div className="flex items-center text-green-600 text-sm font-medium">
+                   <CheckCircle className="w-4 h-4 mr-2" />
+                   轉錄完成
+                 </div>
+                 <button onClick={() => { setFile(null); setStatus('idle'); setSegments([]); }} className="text-sm text-indigo-600 hover:text-indigo-800 font-medium">
+                   處理新檔案
+                 </button>
+               </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      {/* API Key Modal */}
+      {isKeyModalOpen && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden transform transition-all">
+            <div className="bg-indigo-600 px-6 py-4 flex items-center space-x-3">
+              <KeyRound className="w-6 h-6 text-indigo-100" />
+              <h3 className="text-lg font-bold text-white">設定 OpenAI API Key</h3>
+            </div>
+            <div className="p-6">
+              <p className="text-sm text-gray-600 mb-4 leading-relaxed">
+                本系統完全在您的瀏覽器內運作，檔案與資料將直接與 OpenAI 伺服器通訊。我們**不會**儲存您的 API 金鑰。
+              </p>
+              <input type="password" placeholder="sk-..." defaultValue={apiKey} id="api-key-input" className="w-full border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono text-sm" />
+              <div className="mt-6 flex justify-end space-x-3">
+                {apiKey && (
+                  <button onClick={() => setIsKeyModalOpen(false)} className="px-4 py-2 text-gray-600 font-medium hover:bg-gray-100 rounded-lg transition-colors">取消</button>
+                )}
+                <button onClick={() => {
+                    const val = document.getElementById('api-key-input').value.trim();
+                    if (val) saveApiKey(val);
+                  }} className="px-6 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition-colors shadow-sm">
+                  儲存並開始使用
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
